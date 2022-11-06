@@ -3,8 +3,7 @@
 namespace App\Consumers;
 
 use Illuminate\Http\Client\PendingRequest;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Arr;
 
 class Consumer
 {
@@ -12,11 +11,18 @@ class Consumer
     private $useCache;
     private $ttl;
     private $state;
+    private $persistentKeys;
 
     public function __construct()
     {
         $this->useCache = true;
         $this->state = [];
+        $this->state['transformers'] = [];
+        $this->persistentKeys = [];
+    }
+
+    public static function make(...$args) {
+        return new static(...$args);
     }
 
     protected function baseUrl() : string {
@@ -41,7 +47,7 @@ class Consumer
 
     protected function cache($key, callable $callback) {
         if ($this->useCache && $json = cache()->store('redis')->get($key)) {
-            return (object) $json;
+            return $this->runTransformers($json);
         }
 
         $request = app(PendingRequest::class);
@@ -50,7 +56,15 @@ class Consumer
 
         $json = $response->json() ?? [];
         cache()->store('redis')->put($key, $json, $this->ttl);
-        return (object) $json;
+
+        return $this->runTransformers($json);
+    }
+
+    private function runTransformers($json) {
+        foreach($this->state['transformers'] ?? [] as $transformer) {
+            $json = forward_static_call([$transformer, 'transform'], $json);
+        }
+        return $json;
     }
 
     public function withHeaders(array $headers) {
@@ -59,9 +73,15 @@ class Consumer
         });
     }
 
+    public function persistState(array $keys) {
+        return tap($this, function () use ($keys) {
+            $this->persistentKeys = $keys;
+        });
+    }
+
     private function useState($key, callable $callback) {
         return tap($this->cache($key, $callback), function () {
-            $this->state = [];
+            $this->state = Arr::only($this->state, $this->persistentKeys);
         });
     }
 
@@ -132,5 +152,27 @@ class Consumer
             $this->enableCache();
             return call_user_func($callback, $consumer, $ttl);
         }, $ttl);
+    }
+
+    public function withTransformers(array $transformers) {
+        $result = tap($this, function () use ($transformers) {
+            $this->state['transformers'] = $transformers;
+        });
+        return $result;
+    }
+
+    public function withTransformer($transformer) {
+        return tap($this, function () use ($transformer) {
+            $this->state['transformers'][] = $transformer;
+        });
+    }
+
+    public function withoutTransformers(callable $callback) {
+        $oldTransformers = $this->state['transformers'] ?? [];
+        $this->state['transformers'] = [];
+        $result = call_user_func($callback, $this);
+        $this->state['transformers'] = $oldTransformers;
+
+        return $result;
     }
 }
